@@ -1,47 +1,44 @@
 """
-scrape_startup_az_all_pages.py
+scrape_startup_az_linkwise.py
 
-Crawls startup.az listing pages, follows each startup detail page,
-extracts structured fields and images, normalizes Azerbaijani labels
-to English column names, and saves to CSV and XLSX.
+Crawl startup.az using link-wise pagination:
+- Detect max pages via pagination links when available
+- Otherwise follow the "next" link until no more
+- Extract listing cards and visit detail pages
+- Normalize fields and save to CSV and XLSX
 
-Designed to crawl multiple pages (auto-detect total pages).
-Be polite: respect robots.txt / terms of service and avoid heavy load.
-
-Requirements:
+Dependencies:
     pip install requests beautifulsoup4 pandas openpyxl lxml tqdm
 """
 
-from typing import Dict, List, Optional
-from urllib.parse import urljoin, urlparse
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
 import re
 import time
 import random
-from tqdm import tqdm
 import logging
+from typing import Dict, List, Optional
+from urllib.parse import urljoin, urlparse, parse_qs
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from tqdm import tqdm
 
-# ---------- Configuration ----------
+# ------------- Configuration -------------
 BASE_URL = "https://www.startup.az"
 LISTING_PATH = "/startup.html"
-# default per-page param used by the site; we will set per-page=12 as example
 PER_PAGE = 12
 USER_AGENT = "Mozilla/5.0 (compatible; StartupAZScraper/1.0; +https://example.com/bot)"
 TIMEOUT = 15
 SLEEP_MIN = 0.6
 SLEEP_MAX = 1.2
 MAX_RETRIES = 3
-OUTPUT_CSV = "startup_az_all_pages.csv"
-OUTPUT_XLSX = "startup_az_all_pages.xlsx"
-# If pagination detection fails, fallback to at most this many pages to avoid runaway scraping
-FALLBACK_MAX_PAGES = 20
-# -----------------------------------
+OUTPUT_CSV = "startup_az_linkwise.csv"
+OUTPUT_XLSX = "startup_az_linkwise.xlsx"
+MAX_SAFE_PAGES = 300  # absolute safety limit to prevent runaway loops
+# -----------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Map Azerbaijani field labels (approximate) to normalized English keys
+# Azerbaijani label -> English field mapping (extend as needed)
 FIELD_MAPPING = {
     "Başlıq": "Title",
     "Seqment": "Segment",
@@ -57,129 +54,77 @@ FIELD_MAPPING = {
     "Email": "Email",
     "Veb": "Website",
     "Startap Şəhadətnaməsi": "Certification",
-    # possible variants (normalized):
     "Şəkillər": "Images",
-    "Təsvirə": "Description",
 }
 
-# regex helpers
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.I)
 PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{2,3}[\s-]?\d{2,3}[\s-]?\d{2,4}", re.I)
-URL_SCHEME_RE = re.compile(r"^https?://", re.I)
 
 
-def safe_request(session: requests.Session, url: str, retries: int = MAX_RETRIES) -> Optional[requests.Response]:
-    """GET with retries and basic error handling."""
+def session_get(session: requests.Session, url: str, retries: int = MAX_RETRIES) -> Optional[requests.Response]:
+    """GET with retries and error handling."""
     for attempt in range(1, retries + 1):
         try:
-            r = session.get(url, timeout=TIMEOUT)
-            r.raise_for_status()
-            # prefer apparent_encoding if server doesn't specify
-            if r.encoding is None:
-                r.encoding = r.apparent_encoding
-            return r
+            resp = session.get(url, timeout=TIMEOUT)
+            resp.raise_for_status()
+            if resp.encoding is None:
+                resp.encoding = resp.apparent_encoding
+            return resp
         except Exception as e:
-            logging.warning("Request failed (%s) attempt %d/%d: %s", url, attempt, retries, e)
+            logging.warning("GET %s failed (attempt %d/%d): %s", url, attempt, retries, e)
             time.sleep(1 + attempt * 0.5)
     logging.error("Giving up on %s after %d attempts", url, retries)
     return None
 
 
 def get_soup(session: requests.Session, url: str) -> Optional[BeautifulSoup]:
-    resp = safe_request(session, url)
+    resp = session_get(session, url)
     if not resp:
         return None
     return BeautifulSoup(resp.text, "lxml")
 
 
-def detect_total_pages(soup: BeautifulSoup) -> int:
-    """
-    Inspect pagination and return total pages.
-    Looks for pagination links like /startup.html?page=16&per-page=12
-    """
-    try:
-        pag_links = soup.select("ul.pagination a.page-link")
-        pages = set()
-        for a in pag_links:
-            href = a.get("href", "")
-            if "page=" in href:
-                m = re.search(r"page=(\d+)", href)
-                if m:
-                    pages.add(int(m.group(1)))
-            else:
-                # sometimes the link text is page number
-                txt = a.get_text(strip=True)
-                if txt.isdigit():
-                    pages.add(int(txt))
-        if pages:
-            max_page = max(pages)
-            logging.info("Detected %d total pages from pagination", max_page)
-            return max_page
-    except Exception:
-        logging.debug("Pagination detection failed", exc_info=True)
-    logging.warning("Failed to detect total pages; using fallback of %d", FALLBACK_MAX_PAGES)
-    return FALLBACK_MAX_PAGES
-
-
 def parse_listing_cards(soup: BeautifulSoup) -> List[Dict]:
-    """
-    Parse listing cards on a listing page. Returns list of dicts with:
-    - listing_title, short_description, listing_image, detail_url
-    """
+    """Extract cards on a listing page."""
     cards = []
-    # cards are anchors with class card inside .startup-block (from provided HTML)
     anchors = soup.select("div.startup-block a.card")
     if not anchors:
         anchors = soup.select("a.card.mb-4, a.card")
     for a in anchors:
         href = a.get("href", "").strip()
         detail_url = urljoin(BASE_URL, href) if href else None
-
         img_tag = a.find("img", class_="card-img-top")
         img_src = ""
         if img_tag:
             img_src = img_tag.get("src") or img_tag.get("data-src") or ""
-            if img_src:
-                img_src = urljoin(BASE_URL, img_src)
-
+            img_src = urljoin(BASE_URL, img_src) if img_src else ""
         title_tag = a.select_one(".card-body .card-title")
         title = title_tag.get_text(strip=True) if title_tag else None
-
         desc_tag = a.select_one(".card-body .card-text")
         short_desc = desc_tag.get_text(separator=" ", strip=True) if desc_tag else None
-
         cards.append({
             "listing_title": title,
             "short_description": short_desc,
             "listing_image": img_src,
-            "detail_url": detail_url,
+            "detail_url": detail_url
         })
-    logging.info("Parsed %d listing cards", len(cards))
     return cards
 
 
-def map_label_to_key(label: str) -> str:
-    """Map Azerbaijani label to English key; fallback to clean label."""
-    lab = label.strip()
-    if lab in FIELD_MAPPING:
-        return FIELD_MAPPING[lab]
-    # try simpler normalization (remove punctuation, lowercase)
-    lab_norm = re.sub(r"[^A-Za-z0-9əəöçğşİıƏÖÇĞŞÜü\s]", "", lab)
-    # crude matching: check startswith of known keys
-    for az_label, en_key in FIELD_MAPPING.items():
-        if lab.startswith(az_label[:4]) or az_label.startswith(lab[:4]):
-            return en_key
-    return lab_norm or label
+def map_label(label: str) -> str:
+    label = label.strip()
+    if label in FIELD_MAPPING:
+        return FIELD_MAPPING[label]
+    # fallback: sanitize label (remove punctuation) and use as-is
+    safe = re.sub(r"[^\w\s]", "", label)
+    return safe or label
 
 
 def extract_detail_fields(soup: BeautifulSoup, detail_url: str) -> Dict[str, str]:
-    """
-    Extract structured fields from a detail page Soup.
-    Returns a dictionary with normalized keys.
-    """
+    """Extract structured fields from detail page; return normalized dict."""
     data: Dict[str, str] = {}
 
-    # collect all images inside article.post or the entire page as a fallback
+    # Collect images found in article/post
     img_tags = soup.select("article.post img, .post-image img, .blog-single-post img")
     images = []
     for img in img_tags:
@@ -187,157 +132,192 @@ def extract_detail_fields(soup: BeautifulSoup, detail_url: str) -> Dict[str, str
         if src:
             images.append(urljoin(BASE_URL, src))
     if images:
-        # unique preserve order
+        # deduplicate preserving order
         seen = set()
-        uniq_images = []
+        uniq = []
         for u in images:
             if u not in seen:
                 seen.add(u)
-                uniq_images.append(u)
-        data["Images"] = ";".join(uniq_images)
+                uniq.append(u)
+        data["Images"] = ";".join(uniq)
 
-    # parse labeled blocks like <div class="process-step-content"> <h4>Label</h4> <p>Value</p>
+    # Parse labeled blocks .process-step-content
     blocks = soup.select(".process-step-content")
     if blocks:
         for block in blocks:
             label_tag = block.find(["h4", "h3", "strong"])
             if not label_tag:
-                # sometimes label is in strong or bold elements
                 continue
             label = label_tag.get_text(strip=True)
-            # the value is usually subsequent <p class="mb-0"> elements. Join all <p> inside block.
             p_texts = [p.get_text(separator=" ", strip=True) for p in block.find_all("p") if p.get_text(strip=True)]
-            if p_texts:
-                value = " | ".join(p_texts).strip()
-            else:
-                # fallback: any sibling text nodes
-                value = label_tag.find_next_sibling(text=True)
-                value = value.strip() if value else ""
-            key = map_label_to_key(label)
-            # avoid empty assignments
+            value = " | ".join(p_texts).strip() if p_texts else ""
+            key = map_label(label)
             if value:
                 data[key] = value
 
-    # If no structured blocks found, try to find "rows" of label/value pairs (common fallback)
+    # fallback: rows of cards
     if not blocks:
-        candidate_rows = soup.select("div.card-body .row > div")
-        # heuristics: find pairs where first has an h4 and second has p
-        for i in range(0, len(candidate_rows), 1):
-            col = candidate_rows[i]
+        candidate_cols = soup.select("div.card-body .row > div")
+        for i, col in enumerate(candidate_cols):
             h4 = col.find("h4")
-            if h4:
-                label = h4.get_text(strip=True)
-                # value might be next sibling column or the p in same column
-                next_p = col.find("p")
-                value = ""
-                if next_p:
-                    value = next_p.get_text(separator=" ", strip=True)
-                else:
-                    # try next sibling column if exists
-                    try:
-                        nxt = candidate_rows[i+1]
-                        value = nxt.get_text(separator=" ", strip=True)
-                    except Exception:
-                        value = ""
-                if value:
-                    data[map_label_to_key(label)] = value
+            if not h4:
+                continue
+            label = h4.get_text(strip=True)
+            # try get p in same col
+            p = col.find("p")
+            value = p.get_text(separator=" ", strip=True) if p else ""
+            if not value:
+                # maybe next column holds value
+                try:
+                    nxt = candidate_cols[i+1]
+                    value = nxt.get_text(separator=" ", strip=True)
+                except Exception:
+                    value = ""
+            if value:
+                data[map_label(label)] = value
 
-    # Extract long description -- prefer explicit Təsvir / Description
-    desc_candidates = []
-    # Look for main article description paragraphs (first large paragraph)
-    article_ps = soup.select("article.post p, .post .card-body p")
-    for p in article_ps:
-        txt = p.get_text(separator=" ", strip=True)
-        if txt and len(txt) > 20:
-            desc_candidates.append(txt)
-    # If Description key missing but we have candidates, set the first one
-    if "Description" not in data and desc_candidates:
-        data["Description"] = desc_candidates[0]
+    # description fallback: first long paragraph in article
+    long_ps = [p.get_text(separator=" ", strip=True) for p in soup.select("article.post p, .post p") if len(p.get_text(strip=True)) > 30]
+    if long_ps and "Description" not in data:
+        data["Description"] = long_ps[0]
 
-    # Extract contact info from anywhere on the detail page as fallback
-    text_blob = " ".join([t.strip() for t in soup.stripped_strings])
-
-    # Emails
+    # Extract emails, phones, websites from page text
+    text_blob = " ".join(s.strip() for s in soup.stripped_strings)
     emails = set(EMAIL_RE.findall(text_blob))
-    if emails:
-        # preserve any existing Email if set; otherwise use first
-        if "Email" not in data:
-            data["Email"] = ";".join(sorted(emails))
-
-    # Phones — look for phone-like strings; then filter short nonsense
+    if emails and "Email" not in data:
+        data["Email"] = ";".join(sorted(emails))
     phones = set()
     for m in PHONE_RE.findall(text_blob):
-        # normalize whitespace and dashes
         ph = re.sub(r"\s+", " ", m).strip()
-        # avoid capturing short numbers (like '2021' or '50' etc)
         digits = re.sub(r"\D", "", ph)
         if len(digits) >= 6:
             phones.add(ph)
     if phones and "ContactPhone" not in data:
         data["ContactPhone"] = ";".join(sorted(phones))
-
-    # Websites: look for anchors with href or textual urls
+    # websites from anchors
     anchors = soup.select("a")
     websites = set()
     for a in anchors:
         href = a.get("href", "").strip()
-        if href and (href.startswith("http://") or href.startswith("https://")):
+        if href.startswith("http://") or href.startswith("https://"):
             websites.add(href)
-    # If Website field missing and we found at least one (exclude social media if possible)
     if websites and "Website" not in data:
-        # prefer ones that are not facebook/twitter/youtube etc
-        filtered = [w for w in websites if not re.search(r"(facebook|fb\.com|instagram|linkedin|twitter|youtube|tiktok)", w, re.I)]
+        filtered = [w for w in websites if not re.search(r"(facebook|fb\.com|instagram|twitter|linkedin|youtube|tiktok)", w, re.I)]
         pick = filtered[0] if filtered else next(iter(websites))
         data["Website"] = pick
 
-    # Ensure Title exists: sometimes label exists; otherwise fallback to page H1 or listing title
+    # Title fallback (H1/H2 or slug)
     if "Title" not in data:
-        # try H1 or page title
         h1 = soup.find(["h1", "h2"])
         if h1 and h1.get_text(strip=True):
             data["Title"] = h1.get_text(strip=True)
         else:
-            # last fallback: from URL slug
             path = urlparse(detail_url).path
             slug = path.rstrip("/").split("/")[-1]
             data["Title"] = slug
 
-    # Trim values
+    # trim
     for k, v in list(data.items()):
         if isinstance(v, str):
             data[k] = v.strip()
     return data
 
 
-def crawl_all_pages():
+def detect_max_page_from_pagination(soup: BeautifulSoup) -> Optional[int]:
+    """
+    Try to detect the max page from pagination anchors. Consider:
+    - href ?page=N
+    - data-page (zero-indexed)
+    - visible numeric link text
+    """
+    pages = set()
+    for a in soup.select("ul.pagination a, ul.pagination li a, li.page-item a"):
+        # data-page
+        dp = a.get("data-page")
+        if dp and dp.isdigit():
+            # site often uses zero-indexed data-page -> convert
+            pages.add(int(dp) + 1)
+        # visible text
+        txt = a.get_text(strip=True)
+        if txt.isdigit():
+            pages.add(int(txt))
+        # href param
+        href = a.get("href", "")
+        m = re.search(r"[?&]page=(\d+)", href)
+        if m:
+            pages.add(int(m.group(1)))
+    if pages:
+        return max(pages)
+    return None
+
+
+def find_next_link(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Return the href (possibly relative) for the 'next' pagination link.
+    Looks for:
+     - a[rel="next"]
+     - anchors with aria-label/title mentioning next
+     - anchors containing 'angle-right' icon markup or » / › characters
+    """
+    # rel="next"
+    a = soup.select_one('ul.pagination a[rel="next"], a[rel="next"]')
+    if a and a.get("href"):
+        return a["href"]
+    # aria-label or title containing Next
+    for sel in ['ul.pagination a[aria-label*="Next"]', 'ul.pagination a[aria-label*="next"]',
+                'a[aria-label*="Next"]', 'a[aria-label*="next"]', 'a[title*="Next"]', 'a[title*="next"]']:
+        a = soup.select_one(sel)
+        if a and a.get("href"):
+            return a["href"]
+    # anchors that include angle-right icon or entities
+    anchors = soup.select("ul.pagination a, li.page-item a")
+    for a in anchors:
+        inner = (a.decode_contents() or "").lower()
+        if "angle-right" in inner or "&raquo;" in inner or "›" in inner or "→" in inner:
+            href = a.get("href")
+            if href:
+                return href
+    return None
+
+
+
+def crawl_linkwise_follow_next():
+    """
+    Robust link-wise crawler that always follows the 'next' pagination link
+    starting from page=1, rather than trusting the visible numeric page links.
+
+    It will:
+      - Start at page=1
+      - Parse cards on the page
+      - Find the 'next' link (rel=next, aria-label, or anchor showing angle-right)
+      - Follow that link, repeating until no 'next' link or MAX_SAFE_PAGES reached
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
-    # Start from page 1 to detect pagination
-    first_listing_url = f"{BASE_URL}{LISTING_PATH}?page=1&per-page={PER_PAGE}"
-    logging.info("Fetching first listing page to detect pagination: %s", first_listing_url)
-    soup = get_soup(session, first_listing_url)
-    if not soup:
-        raise RuntimeError("Could not fetch first listing page")
 
-    total_pages = detect_total_pages(soup)
-    # limit to sensible maximum
-    total_pages = min(total_pages, FALLBACK_MAX_PAGES)
-    logging.info("Will crawl %d pages", total_pages)
+    start_url = f"{BASE_URL}{LISTING_PATH}?page=1&per-page={PER_PAGE}"
+    logging.info("Starting link-wise crawl (follow-next) at %s", start_url)
 
-    all_rows: List[Dict] = []
-    seen_detail_urls = set()
+    current_url = start_url
+    pages_crawled = 0
+    all_rows = []
+    seen_detail = set()
 
-    for page in range(1, total_pages + 1):
-        listing_url = f"{BASE_URL}{LISTING_PATH}?page={page}&per-page={PER_PAGE}"
-        logging.info("Processing listing page %d/%d: %s", page, total_pages, listing_url)
-        page_soup = get_soup(session, listing_url)
-        if page_soup is None:
-            logging.warning("Skipping page %d due to fetch failure", page)
-            continue
+    while current_url and pages_crawled < MAX_SAFE_PAGES:
+        logging.info("Fetching listing page: %s", current_url)
+        listing_soup = get_soup(session, current_url)
+        if not listing_soup:
+            logging.warning("Failed to fetch %s — stopping crawl.", current_url)
+            break
 
-        cards = parse_listing_cards(page_soup)
-        # iterate cards
-        for card in tqdm(cards, desc=f"Page {page}", unit="card"):
+        cards = parse_listing_cards(listing_soup)
+        logging.info("Parsed %d listing cards", len(cards))
+        if not cards:
+            logging.info("No cards found — stopping crawl.")
+            break
+
+        # Process each card on the current page
+        for card in tqdm(cards, desc=f"Page {pages_crawled+1}", unit="card"):
             row = {
                 "listing_title": card.get("listing_title"),
                 "short_description": card.get("short_description"),
@@ -345,41 +325,44 @@ def crawl_all_pages():
                 "detail_url": card.get("detail_url"),
             }
             detail_url = card.get("detail_url")
-            if not detail_url:
-                logging.warning("Card has no detail URL; skipping: %s", row.get("listing_title"))
-                all_rows.append(row)
-                continue
-
-            # deduplicate detail pages
-            if detail_url in seen_detail_urls:
-                logging.debug("Already scraped detail URL: %s", detail_url)
-                all_rows.append(row)
-                continue
-            seen_detail_urls.add(detail_url)
-
-            # polite sleep
-            time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
-            detail_soup = get_soup(session, detail_url)
-            if not detail_soup:
-                logging.warning("Failed to fetch detail page: %s", detail_url)
-                all_rows.append(row)
-                continue
-
-            fields = extract_detail_fields(detail_soup, detail_url)
-            # prefer detail Title over listing_title if present
-            if fields.get("Title"):
-                row["Title"] = fields.pop("Title")
-            # merge remaining fields (do not overwrite listing keys)
-            for k, v in fields.items():
-                if k in row and not row.get(k):  # if column exists but empty, fill it
-                    row[k] = v
-                elif k not in row:
-                    row[k] = v
-                else:
-                    # if both exist and differ, keep both: detail_{k}
-                    if row.get(k) != v:
-                        row[f"detail_{k}"] = v
+            if detail_url and detail_url not in seen_detail:
+                seen_detail.add(detail_url)
+                time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+                detail_soup = get_soup(session, detail_url)
+                if detail_soup:
+                    fields = extract_detail_fields(detail_soup, detail_url)
+                    # prefer Title from detail
+                    if fields.get("Title"):
+                        row["Title"] = fields.pop("Title")
+                    for k, v in fields.items():
+                        if k not in row or not row.get(k):
+                            row[k] = v
+                        else:
+                            if str(row.get(k)) != str(v):
+                                row[f"detail_{k}"] = v
             all_rows.append(row)
+
+        pages_crawled += 1
+
+        # Find next link on current listing page
+        nxt = find_next_link(listing_soup)
+        if not nxt:
+            logging.info("No next link found on page %d — crawl finished.", pages_crawled)
+            break
+
+        # Ensure per-page param stays present
+        parsed = urlparse(nxt)
+        if "per-page" not in parsed.query:
+            sep = "&" if "?" in nxt else "?"
+            nxt = f"{nxt}{sep}per-page={PER_PAGE}"
+
+        # Normalize next to absolute URL
+        current_url = urljoin(BASE_URL, nxt)
+
+        # Polite sleep before fetching the next listing page
+        time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+
+    logging.info("Link-wise follow-next crawl finished: crawled %d pages, %d items", pages_crawled, len(all_rows))
     return all_rows
 
 
@@ -388,21 +371,19 @@ def save_results(rows: List[Dict], csv_path: str, xlsx_path: str):
         logging.warning("No rows to save")
         return
     df = pd.DataFrame(rows)
-    # reorder columns: prefer listing fields first then normalized keys sorted
-    preferred = ["Title", "listing_title", "short_description", "Description", "listing_image", "Images", "detail_url", "Website", "Email", "ContactPhone", "Founders", "Team", "LookingForTeam", "FoundedDate", "Status", "Investments", "Programs", "Certification"]
+    preferred = ["Title", "listing_title", "short_description", "Description", "listing_image", "Images", "detail_url", "Website", "Email", "ContactPhone"]
     cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
     df = df[cols]
-    # Save CSV with BOM so Excel can open UTF-8
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     df.to_excel(xlsx_path, index=False, engine="openpyxl")
     logging.info("Saved %d rows to %s and %s", len(df), csv_path, xlsx_path)
 
 
 def main():
-    logging.info("Starting full crawl of startup.az")
-    rows = crawl_all_pages()
+    logging.info("Starting link-wise crawl for startup.az")
+    rows = crawl_linkwise_follow_next()
     save_results(rows, OUTPUT_CSV, OUTPUT_XLSX)
-    logging.info("Finished. Total startups scraped: %d", len(rows))
+    logging.info("Crawl complete. Total startups scraped: %d", len(rows))
 
 
 if __name__ == "__main__":
