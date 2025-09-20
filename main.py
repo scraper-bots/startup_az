@@ -124,6 +124,10 @@ def extract_detail_fields(soup: BeautifulSoup, detail_url: str) -> Dict[str, str
     """Extract structured fields from detail page; return normalized dict."""
     data: Dict[str, str] = {}
 
+    # Debug logging for segment issues
+    if "profam" in detail_url.lower():
+        logging.debug("Processing Profam startup for segment extraction")
+
     # Collect images found in article/post
     img_tags = soup.select("article.post img, .post-image img, .blog-single-post img")
     images = []
@@ -149,32 +153,122 @@ def extract_detail_fields(soup: BeautifulSoup, detail_url: str) -> Dict[str, str
             if not label_tag:
                 continue
             label = label_tag.get_text(strip=True)
-            p_texts = [p.get_text(separator=" ", strip=True) for p in block.find_all("p") if p.get_text(strip=True)]
+
+            # Enhanced value extraction for better segment capture
+            p_texts = []
+            for p in block.find_all("p"):
+                p_text = p.get_text(separator=" ", strip=True)
+                if p_text:
+                    p_texts.append(p_text)
+
+            # If no p tags found, try getting direct text after the label
+            if not p_texts:
+                # Remove the label tag and get remaining text
+                label_tag_copy = label_tag.extract()
+                remaining_text = block.get_text(separator=" ", strip=True)
+                if remaining_text:
+                    p_texts = [remaining_text]
+                # Put the label tag back
+                block.insert(0, label_tag_copy)
+
             value = " | ".join(p_texts).strip() if p_texts else ""
             key = map_label(label)
-            if value:
+            if value and value not in ["---", "----", ""]:
                 data[key] = value
 
-    # fallback: rows of cards
+    # Enhanced fallback: try different selectors for card structure
     if not blocks:
-        candidate_cols = soup.select("div.card-body .row > div")
-        for i, col in enumerate(candidate_cols):
-            h4 = col.find("h4")
-            if not h4:
-                continue
-            label = h4.get_text(strip=True)
-            # try get p in same col
-            p = col.find("p")
-            value = p.get_text(separator=" ", strip=True) if p else ""
-            if not value:
-                # maybe next column holds value
-                try:
-                    nxt = candidate_cols[i+1]
-                    value = nxt.get_text(separator=" ", strip=True)
-                except Exception:
+        # Try multiple card selectors
+        card_selectors = [
+            "div.card-body .row > div",
+            ".card .row > div",
+            ".process-step",
+            "div[class*='col-md'] .process-step-content"
+        ]
+
+        for selector in card_selectors:
+            candidate_cols = soup.select(selector)
+            if candidate_cols:
+                for i, col in enumerate(candidate_cols):
+                    h4 = col.find(["h4", "h3", "strong"])
+                    if not h4:
+                        continue
+                    label = h4.get_text(strip=True)
+
+                    # Enhanced value extraction
+                    p = col.find("p")
                     value = ""
-            if value:
-                data[map_label(label)] = value
+                    if p:
+                        value = p.get_text(separator=" ", strip=True)
+
+                    # If no value found in same col, try different approaches
+                    if not value or value in ["---", "----"]:
+                        # Try next sibling
+                        try:
+                            nxt = candidate_cols[i+1] if i+1 < len(candidate_cols) else None
+                            if nxt:
+                                nxt_p = nxt.find("p")
+                                if nxt_p:
+                                    value = nxt_p.get_text(separator=" ", strip=True)
+                        except Exception:
+                            pass
+
+                        # Try getting text directly after the header
+                        if not value or value in ["---", "----"]:
+                            h4_copy = h4.extract()
+                            direct_text = col.get_text(separator=" ", strip=True)
+                            if direct_text and direct_text not in ["---", "----"]:
+                                value = direct_text
+                            col.insert(0, h4_copy)
+
+                    if value and value not in ["---", "----", ""]:
+                        data[map_label(label)] = value
+                break  # If we found content with this selector, don't try others
+
+    # Additional specific segment extraction attempts
+    if "Segment" not in data:
+        # Try to find segment specifically by looking for "Seqment" text
+        segment_patterns = [
+            # Look for h4 containing "Seqment" and get following p
+            lambda: soup.find("h4", string=re.compile(r"Seqment", re.I)),
+            # Look for any element containing "Seqment"
+            lambda: soup.find(string=re.compile(r"Seqment", re.I)),
+            # Look for elements with text containing segment-like keywords
+            lambda: soup.find("h4", string=re.compile(r"(segment|sektor|sahə)", re.I))
+        ]
+
+        for pattern_func in segment_patterns:
+            try:
+                element = pattern_func()
+                if element:
+                    # If it's a string, get its parent
+                    if hasattr(element, 'parent'):
+                        parent = element.parent if hasattr(element, 'parent') else element
+                    else:
+                        parent = element
+
+                    # Look for the value in the next sibling or parent's sibling
+                    if parent:
+                        # Try parent's next sibling
+                        next_elem = parent.find_next_sibling()
+                        if next_elem:
+                            segment_value = next_elem.get_text(strip=True)
+                            if segment_value and segment_value not in ["---", "----", ""]:
+                                data["Segment"] = segment_value
+                                break
+
+                        # Try looking within parent's parent for p tag
+                        if not data.get("Segment"):
+                            parent_container = parent.parent
+                            if parent_container:
+                                p_tag = parent_container.find("p")
+                                if p_tag:
+                                    segment_value = p_tag.get_text(strip=True)
+                                    if segment_value and segment_value not in ["---", "----", ""]:
+                                        data["Segment"] = segment_value
+                                        break
+            except Exception:
+                continue
 
     # description fallback: first long paragraph in article
     long_ps = [p.get_text(separator=" ", strip=True) for p in soup.select("article.post p, .post p") if len(p.get_text(strip=True)) > 30]
